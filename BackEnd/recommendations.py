@@ -1,126 +1,80 @@
-from dotenv import load_dotenv
+import os
 import requests
 import pandas as pd
 import numpy as np
-import os
-from sklearn.preprocessing import MultiLabelBinarizer, MinMaxScaler
+from dotenv import load_dotenv
+from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ===========================
-# SETUP: Your TMDB API Key
-# ===========================
+# === Load environment variable ===
 load_dotenv()
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY")  # Replace with your TMDB API key
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
-# ===========================
-# FUNCTION 1: Fetch Movie Data from TMDB
-# ===========================
-def fetch_movies_from_tmdb(pages=2):
-    """
-    Fetch popular movies from TMDB.
-    Each movie includes title, genres, tags (keywords), release year, and duration.
-    """
-    movies = []
+# === Fetch TMDB genre ID-to-name map ===
+def get_genre_map():
+    genre_url = f"https://api.themoviedb.org/3/genre/movie/list?api_key={TMDB_API_KEY}&language=en-US"
+    response = requests.get(genre_url)
+    data = response.json()
+    return {genre["id"]: genre["name"] for genre in data.get("genres", [])}
 
+# === Fetch movies from TMDB with genre names and release year ===
+def fetch_tmdb_movies(pages=3):
+    genre_map = get_genre_map()
+    all_movies = []
     for page in range(1, pages + 1):
-        url = f"https://api.themoviedb.org/3/movie/popular?api_key={TMDB_API_KEY}&language=en-US&page={page}"
+        url = f"https://api.themoviedb.org/3/discover/movie?api_key={TMDB_API_KEY}&language=en-US&sort_by=popularity.desc&include_adult=false&page={page}"
         response = requests.get(url)
         data = response.json()
 
-        for movie in data['results']:
-            movies.append({
-                'title': movie['title'],
-                'genres': [g['name'] for g in get_genres_by_ids(movie['genre_ids'])],
-                'tags': get_keywords(movie['id']),
-                'year': int(movie['release_date'].split('-')[0]) if movie.get('release_date') else 2000,
-                'duration': get_runtime(movie['id'])
+        for item in data.get("results", []):
+            genres = [genre_map.get(genre_id, "Unknown") for genre_id in item.get("genre_ids", [])]
+            release_date = item.get("release_date", "2000-01-01")
+            year = int(release_date.split("-")[0]) if release_date else 2000
+            all_movies.append({
+                'title': item.get('title', ''),
+                'genres': genres,
+                'tags': ["popular", "trending"],  # still placeholder
+                'year': year,
+                'duration': 100,  # placeholder; TMDB requires separate call to get actual runtime
+                'actors': "Unknown"
             })
+    return pd.DataFrame(all_movies)
 
-    return pd.DataFrame(movies)
+# === Load dataset ===
+movies_df = fetch_tmdb_movies()
 
-# ===========================
-# FUNCTION 2: Convert Genre IDs to Names
-# ===========================
-def get_genres_by_ids(ids):
-    genre_map = {
-        28: 'Action', 12: 'Adventure', 16: 'Animation', 35: 'Comedy', 80: 'Crime',
-        99: 'Documentary', 18: 'Drama', 10751: 'Family', 14: 'Fantasy', 36: 'History',
-        27: 'Horror', 10402: 'Music', 9648: 'Mystery', 10749: 'Romance',
-        878: 'Sci-Fi', 10770: 'TV Movie', 53: 'Thriller', 10752: 'War', 37: 'Western'
-    }
-    return [{'id': g, 'name': genre_map.get(g, 'Unknown')} for g in ids]
-
-# ===========================
-# FUNCTION 3: Get Movie Runtime from TMDB
-# ===========================
-def get_runtime(movie_id):
-    url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key={TMDB_API_KEY}"
-    response = requests.get(url).json()
-    return response.get('runtime', 100)
-
-# ===========================
-# FUNCTION 4: Get Movie Keywords (Tags)
-# ===========================
-def get_keywords(movie_id):
-    url = f"https://api.themoviedb.org/3/movie/{movie_id}/keywords?api_key={TMDB_API_KEY}"
-    response = requests.get(url).json()
-    return [kw['name'] for kw in response.get('keywords', [])]
-
-# ===========================
-# LOAD & PROCESS MOVIE DATA
-# ===========================
-movies_df = fetch_movies_from_tmdb(pages=5)
-
-# Convert genre and tags into list format if needed
-movies_df['genres'] = movies_df['genres'].apply(lambda x: x if isinstance(x, list) else [])
-movies_df['tags'] = movies_df['tags'].apply(lambda x: x if isinstance(x, list) else [])
-
-# One-hot encode genres and tags
+# === Feature encoding ===
 mlb_genres = MultiLabelBinarizer()
 mlb_tags = MultiLabelBinarizer()
 
-genres_encoded = mlb_genres.fit_transform(movies_df['genres'])
-tags_encoded = mlb_tags.fit_transform(movies_df['tags'])
+genre_encoded = mlb_genres.fit_transform(movies_df['genres'])
+tag_encoded = mlb_tags.fit_transform(movies_df['tags'])
 
-# Normalize year and duration
-scaler = MinMaxScaler()
-numerical_features = scaler.fit_transform(movies_df[['year', 'duration']])
+scaled_numeric = StandardScaler().fit_transform(movies_df[['year', 'duration']])
+movie_vectors = np.hstack([genre_encoded, tag_encoded, scaled_numeric])
 
-# Combine all movie features into one matrix
-movie_vectors = np.hstack([genres_encoded, tags_encoded, numerical_features])
+# === Search Function ===
+def recommend_by_search(query: str, top_n=10):
+    query_lower = query.lower()
+    matched = movies_df[
+        movies_df['title'].str.lower().str.contains(query_lower) |
+        movies_df['genres'].astype(str).str.lower().str.contains(query_lower) |
+        movies_df['actors'].str.lower().str.contains(query_lower)
+    ]
+    if matched.empty:
+        print(f"❌ No movies found matching '{query}'")
+        return pd.DataFrame(columns=['title', 'genres', 'year', 'duration'])
 
-# ===========================
-# FUNCTION 5: Recommend Movies
-# ===========================
+    return matched[['title', 'genres', 'year', 'duration']].head(top_n)
+
+# === Preference-Based Recommendation Function ===
 def recommend_movies(user_preferences: dict, top_n=10):
-    """
-    Recommend top N movies based on:
-    - Liked movies
-    - Preferred genres and tags
-    - Year range
-    - Duration
-    
-    Parameters:
-    - user_preferences (dict):
-        - 'liked_movies': list of liked movie titles (must be in dataset)
-        - 'genres': list of preferred genres (optional)
-        - 'tags': list of preferred tags (optional)
-        - 'year_range': (min_year, max_year) tuple
-        - 'duration': preferred movie duration (int)
-    - top_n: number of movies to recommend
-
-    Returns:
-    - DataFrame with top recommended movies
-    """
-
-    # Extract user preferences
     liked_titles = user_preferences.get('liked_movies', [])
     preferred_genres = user_preferences.get('genres', [])
     preferred_tags = user_preferences.get('tags', [])
     year_min, year_max = user_preferences.get('year_range', (2000, 2024))
     preferred_duration = user_preferences.get('duration', 100)
 
-    # Step 1: Get liked movie vectors
     liked_movies = movies_df[movies_df['title'].isin(liked_titles)]
     if liked_movies.empty:
         print("⚠️ No liked movies matched the dataset.")
@@ -129,53 +83,56 @@ def recommend_movies(user_preferences: dict, top_n=10):
     liked_indices = liked_movies.index.tolist()
     liked_vectors = movie_vectors[liked_indices]
 
-    # Step 2: Encode genres and tags from user input
     user_genres = mlb_genres.transform([preferred_genres])
     user_tags = mlb_tags.transform([preferred_tags])
-    user_numeric = scaler.transform([[np.mean([year_min, year_max]), preferred_duration]])
+    user_numeric = StandardScaler().fit_transform([[np.mean([year_min, year_max]), preferred_duration]])
 
-    # Step 3: Combine liked movies' vector and user preferences into one profile
     liked_vector_avg = np.mean(liked_vectors, axis=0).reshape(1, -1)
     user_vector = np.hstack([user_genres, user_tags, user_numeric])
 
-    # Make sure vectors are same shape (pad if needed)
     if liked_vector_avg.shape[1] < user_vector.shape[1]:
-        padding = np.zeros((1, user_vector.shape[1] - liked_vector_avg.shape[1]))
-        liked_vector_avg = np.hstack([liked_vector_avg, padding])
+        liked_vector_avg = np.hstack([liked_vector_avg, np.zeros((1, user_vector.shape[1] - liked_vector_avg.shape[1]))])
     elif user_vector.shape[1] < liked_vector_avg.shape[1]:
-        padding = np.zeros((1, liked_vector_avg.shape[1] - user_vector.shape[1]))
-        user_vector = np.hstack([user_vector, padding])
+        user_vector = np.hstack([user_vector, np.zeros((1, liked_vector_avg.shape[1] - user_vector.shape[1]))])
 
-    # Combine both (50% weight each)
     final_user_vector = (liked_vector_avg + user_vector) / 2
 
-    # Step 4: Filter movies in the selected year range
-    valid_indices = movies_df[
-        (movies_df['year'] >= year_min) & (movies_df['year'] <= year_max)
-    ].index.tolist()
+    valid_indices = movies_df[(movies_df['year'] >= year_min) & (movies_df['year'] <= year_max)].index.tolist()
     valid_vectors = movie_vectors[valid_indices]
 
-    # Step 5: Compute cosine similarity
     similarities = cosine_similarity(final_user_vector, valid_vectors)[0]
 
-    # Step 6: Get top N recommendations
     top_relative_indices = similarities.argsort()[-top_n:][::-1]
     top_absolute_indices = [valid_indices[i] for i in top_relative_indices]
 
-    # Exclude movies the user already liked
     final_recommendations = movies_df.iloc[top_absolute_indices]
     final_recommendations = final_recommendations[~final_recommendations['title'].isin(liked_titles)]
 
     return final_recommendations[['title', 'genres', 'year', 'duration']]
-user_input = {
-    'liked_movies': ['Laila', 'Bad Influence'],
-    'genres': ['Romance', 'Drama'],
-    'tags': ['love', 'heartbreak'],
-    'year_range': (2005, 2023),
-    'duration': 120
-}
 
-recommended = recommend_movies(user_input, top_n=10)
+# === Decision wrapper ===
+def handle_user_input(user_input: dict, top_n=10):
+    search_query = user_input.get("search_query", "").strip()
+    if search_query:
+        return recommend_by_search(search_query, top_n=top_n)
+    elif user_input.get("genres") or user_input.get("year_range"):
+        return recommend_movies(user_input, top_n=top_n)
+    else:
+        print("⚠️ No valid input provided.")
+        return pd.DataFrame(columns=['title', 'genres', 'year', 'duration'])
 
-print("\n🎬 Recommended Movies Based on Your Preferences:\n")
-print(recommended)
+if __name__ == "__main__":
+    print("🔍 Search Test:")
+    user_input = {"search_query": "Logan"}
+    print(handle_user_input(user_input))
+
+    print("\n🎯 Preference Test:")
+    user_input = {
+        "liked_movies": ["Logan"],
+        "genres": ["Action"],
+        "tags": ["popular"],
+        "year_range": (1990, 2025),
+        "duration": 120
+    }
+    print(handle_user_input(user_input))
+
